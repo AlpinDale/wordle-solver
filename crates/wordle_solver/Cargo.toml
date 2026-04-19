@@ -8,5 +8,8 @@ license.workspace = true
 name = "wordle_solver"
 path = "src/lib.rs"
 
+[dependencies]
+rustc-hash = "2"
+
 [lints]
 workspace = true

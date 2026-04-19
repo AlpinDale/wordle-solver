@@ -1,5 +1,11 @@
+use std::sync::{Mutex, OnceLock};
+
+use rustc_hash::FxHashMap;
+
 use crate::corpus::Corpus;
 use crate::{Feedback, SolverError, Word, FEEDBACK_STATES};
+
+static NEXT_GUESS_CACHE: OnceLock<Mutex<FxHashMap<Vec<u16>, usize>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct SolveStep {
@@ -23,6 +29,8 @@ pub enum SolverStatus {
 #[derive(Debug)]
 pub struct OfficialSolver {
     remaining: Box<[u64]>,
+    remaining_answers: Vec<u16>,
+    remaining_answer_guess_flags: Box<[u8]>,
     remaining_count: usize,
     pending_guess: Option<usize>,
     cached_guess: Option<usize>,
@@ -41,6 +49,22 @@ struct GuessScore {
     expected_bucket_sum: u32,
     prefer_answer: bool,
     guess_index: usize,
+}
+
+struct GuessScoringScratch {
+    histogram: [u16; FEEDBACK_STATES],
+    epochs: [u16; FEEDBACK_STATES],
+    epoch: u16,
+}
+
+impl GuessScoringScratch {
+    fn new() -> Self {
+        Self {
+            histogram: [0_u16; FEEDBACK_STATES],
+            epochs: [0_u16; FEEDBACK_STATES],
+            epoch: 1,
+        }
+    }
 }
 
 impl GuessScore {
@@ -68,9 +92,18 @@ impl OfficialSolver {
             let last_index = remaining.len() - 1;
             remaining[last_index] = (1_u64 << trailing) - 1;
         }
+        let remaining_answers = (0..corpus.answer_count())
+            .map(|answer_index| answer_index as u16)
+            .collect();
+        let mut remaining_answer_guess_flags = vec![0_u8; corpus.guess_count()].into_boxed_slice();
+        for answer_index in 0..corpus.answer_count() {
+            remaining_answer_guess_flags[corpus.answer_guess_index(answer_index)] = 1;
+        }
 
         Ok(Self {
             remaining,
+            remaining_answers,
+            remaining_answer_guess_flags,
             remaining_count: corpus.answer_count(),
             pending_guess: None,
             cached_guess: Some(corpus.first_guess_index()),
@@ -96,8 +129,10 @@ impl OfficialSolver {
     pub fn remaining_candidates(&self) -> Result<Vec<Word>, SolverError> {
         let corpus = Corpus::load()?;
         Ok(self
-            .iter_remaining_answers()
-            .map(|answer_index| corpus.answer_word(answer_index))
+            .remaining_answers
+            .iter()
+            .copied()
+            .map(|answer_index| corpus.answer_word(answer_index as usize))
             .collect())
     }
 
@@ -110,9 +145,23 @@ impl OfficialSolver {
             Ok(corpus) => corpus,
             Err(error) => panic!("official bundle should be present: {error}"),
         };
-        let guess_index = self
-            .cached_guess
-            .unwrap_or_else(|| self.compute_best_guess(corpus));
+        let guess_index = self.cached_guess.unwrap_or_else(|| {
+            let cache = NEXT_GUESS_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
+            if let Some(&guess_index) = cache
+                .lock()
+                .expect("next-guess cache lock should not be poisoned")
+                .get(self.remaining_answers.as_slice())
+            {
+                return guess_index;
+            }
+
+            let guess_index = self.compute_best_guess(corpus);
+            cache
+                .lock()
+                .expect("next-guess cache lock should not be poisoned")
+                .insert(self.remaining_answers.clone(), guess_index);
+            guess_index
+        });
         self.issue_guess_index(guess_index, corpus)
     }
 
@@ -140,23 +189,32 @@ impl OfficialSolver {
             .take()
             .ok_or(SolverError::GuessNotIssued)?;
 
-        let mut next_remaining = self.remaining.clone();
-        let mut next_count = 0_usize;
+        let mut next_remaining = vec![0_u64; self.remaining.len()].into_boxed_slice();
+        let mut next_answers = Vec::with_capacity(self.remaining_answers.len());
+        let feedback_row = corpus.feedback_row(guess_index);
+        let feedback_code = feedback.code();
 
-        for answer_index in self.iter_remaining_answers() {
-            let matches = corpus.feedback(guess_index, answer_index) == feedback;
-            set_bit(&mut next_remaining, answer_index, matches);
-            if matches {
-                next_count += 1;
+        for &answer_index in &self.remaining_answers {
+            let answer_index = answer_index as usize;
+            if feedback_row[answer_index] == feedback_code {
+                set_bit(&mut next_remaining, answer_index, true);
+                next_answers.push(answer_index as u16);
             }
         }
 
-        if next_count == 0 {
+        if next_answers.is_empty() {
             return Err(SolverError::Contradiction);
         }
 
+        let mut next_flags = vec![0_u8; corpus.guess_count()].into_boxed_slice();
+        for &answer_index in &next_answers {
+            next_flags[corpus.answer_guess_index(answer_index as usize)] = 1;
+        }
+
         self.remaining = next_remaining;
-        self.remaining_count = next_count;
+        self.remaining_count = next_answers.len();
+        self.remaining_answers = next_answers;
+        self.remaining_answer_guess_flags = next_flags;
         self.cached_guess = None;
 
         if feedback.is_solved() {
@@ -195,14 +253,14 @@ impl OfficialSolver {
 
     fn compute_best_guess(&self, corpus: &Corpus) -> usize {
         if self.remaining_count == 1 {
-            let Some(answer_index) = self.iter_remaining_answers().next() else {
+            let Some(&answer_index) = self.remaining_answers.first() else {
                 debug_assert!(
                     false,
                     "single-answer state should have one remaining answer"
                 );
                 return corpus.first_guess_index();
             };
-            return corpus.answer_guess_index(answer_index);
+            return corpus.answer_guess_index(answer_index as usize);
         }
 
         let mut best = GuessScore {
@@ -212,82 +270,92 @@ impl OfficialSolver {
             guess_index: usize::MAX,
         };
 
-        let mut histogram = [0_u16; FEEDBACK_STATES];
+        let mut scratch = GuessScoringScratch::new();
+        for &answer_index in &self.remaining_answers {
+            let guess_index = corpus.answer_guess_index(answer_index as usize);
+            if let Some(score) =
+                self.score_guess_index(corpus, guess_index, true, best, &mut scratch)
+            {
+                if score.better_than(best) {
+                    best = score;
+                }
+            }
+        }
+
         for guess_index in 0..corpus.guess_count() {
-            histogram.fill(0);
-
-            for answer_index in self.iter_remaining_answers() {
-                let feedback = corpus.feedback(guess_index, answer_index);
-                histogram[feedback.code() as usize] += 1;
+            if self.remaining_answer_guess_flags[guess_index] != 0 {
+                continue;
             }
-
-            let mut worst_bucket = 0_u16;
-            let mut expected_bucket_sum = 0_u32;
-            for &bucket_size in &histogram {
-                worst_bucket = worst_bucket.max(bucket_size);
-                expected_bucket_sum += u32::from(bucket_size) * u32::from(bucket_size);
-            }
-
-            let score = GuessScore {
-                worst_bucket,
-                expected_bucket_sum,
-                prefer_answer: self.guess_is_remaining_answer(corpus, guess_index),
+            if let Some(score) = self.score_guess_index(
+                corpus,
                 guess_index,
-            };
-
-            if score.better_than(best) {
-                best = score;
+                false,
+                best,
+                &mut scratch,
+            ) {
+                if score.better_than(best) {
+                    best = score;
+                }
             }
         }
 
         best.guess_index
     }
 
-    fn guess_is_remaining_answer(&self, corpus: &Corpus, guess_index: usize) -> bool {
-        if !corpus.is_answer_guess(guess_index) {
-            return false;
+    #[inline(always)]
+    fn score_guess_index(
+        &self,
+        corpus: &Corpus,
+        guess_index: usize,
+        prefer_answer: bool,
+        best: GuessScore,
+        scratch: &mut GuessScoringScratch,
+    ) -> Option<GuessScore> {
+        scratch.epoch = scratch.epoch.wrapping_add(1);
+        if scratch.epoch == 0 {
+            scratch.epochs.fill(0);
+            scratch.epoch = 1;
         }
-        corpus
-            .find_answer(corpus.guess_word(guess_index))
-            .is_some_and(|answer_index| get_bit(&self.remaining, answer_index))
-    }
 
-    fn iter_remaining_answers(&self) -> impl Iterator<Item = usize> + '_ {
-        self.remaining
-            .iter()
-            .enumerate()
-            .flat_map(|(block_index, &block)| BitBlockIterator {
-                block,
-                base_index: block_index * 64,
-            })
+        let mut worst_bucket = 0_u16;
+        let mut expected_bucket_sum = 0_u32;
+        let feedback_row = corpus.feedback_row(guess_index);
+
+        for &answer_index in &self.remaining_answers {
+            let bucket_index = feedback_row[answer_index as usize] as usize;
+            let previous = if scratch.epochs[bucket_index] == scratch.epoch {
+                scratch.histogram[bucket_index]
+            } else {
+                scratch.epochs[bucket_index] = scratch.epoch;
+                scratch.histogram[bucket_index] = 0;
+                0
+            };
+
+            let next = previous + 1;
+            scratch.histogram[bucket_index] = next;
+            expected_bucket_sum += u32::from(previous) * 2 + 1;
+            worst_bucket = worst_bucket.max(next);
+
+            if worst_bucket > best.worst_bucket
+                || (worst_bucket == best.worst_bucket
+                    && expected_bucket_sum > best.expected_bucket_sum)
+            {
+                return None;
+            }
+        }
+
+        Some(GuessScore {
+            worst_bucket,
+            expected_bucket_sum,
+            prefer_answer,
+            guess_index,
+        })
     }
 
     fn issue_guess_index(&mut self, guess_index: usize, corpus: &Corpus) -> Word {
         self.pending_guess = Some(guess_index);
         corpus.guess_word(guess_index)
     }
-}
-
-struct BitBlockIterator {
-    block: u64,
-    base_index: usize,
-}
-
-impl Iterator for BitBlockIterator {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.block == 0 {
-            return None;
-        }
-        let offset = self.block.trailing_zeros() as usize;
-        self.block &= self.block - 1;
-        Some(self.base_index + offset)
-    }
-}
-
-fn get_bit(words: &[u64], index: usize) -> bool {
-    (words[index / 64] >> (index % 64)) & 1 == 1
 }
 
 fn set_bit(words: &mut [u64], index: usize, enabled: bool) {

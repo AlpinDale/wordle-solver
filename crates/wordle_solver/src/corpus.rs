@@ -30,7 +30,6 @@ impl Corpus {
             answer_positions[guess_index as usize] =
                 u16::try_from(answer_index).map_err(|_| SolverError::AssetCorrupt)?;
         }
-
         Ok(Self {
             corpus_hash: bundle.corpus_hash,
             guesses: bundle.guesses,
@@ -65,8 +64,15 @@ impl Corpus {
         self.guesses[self.answer_ids[answer_index] as usize]
     }
 
+    #[inline(always)]
     pub fn answer_guess_index(&self, answer_index: usize) -> usize {
         self.answer_ids[answer_index] as usize
+    }
+
+    #[inline(always)]
+    pub fn answer_index_for_guess(&self, guess_index: usize) -> Option<usize> {
+        let answer_index = self.answer_positions[guess_index];
+        (answer_index != u16::MAX).then_some(answer_index as usize)
     }
 
     pub fn find_guess(&self, word: Word) -> Option<usize> {
@@ -74,18 +80,20 @@ impl Corpus {
     }
 
     pub fn find_answer(&self, word: Word) -> Option<usize> {
-        self.find_guess(word).and_then(|guess_index| {
-            let answer_index = self.answer_positions[guess_index];
-            (answer_index != u16::MAX).then_some(answer_index as usize)
-        })
+        self.find_guess(word)
+            .and_then(|guess_index| self.answer_index_for_guess(guess_index))
     }
 
+    #[inline(always)]
+    pub fn feedback_row(&self, guess_index: usize) -> &[u8] {
+        let answer_count = self.answer_count();
+        let start = guess_index * answer_count;
+        &self.feedback_matrix[start..start + answer_count]
+    }
+
+    #[inline(always)]
     pub fn feedback(&self, guess_index: usize, answer_index: usize) -> Feedback {
-        let matrix_index = guess_index * self.answer_count() + answer_index;
-        Feedback::from_code(self.feedback_matrix[matrix_index])
+        Feedback::from_code(self.feedback_row(guess_index)[answer_index])
     }
 
-    pub fn is_answer_guess(&self, guess_index: usize) -> bool {
-        self.answer_positions[guess_index] != u16::MAX
-    }
 }
