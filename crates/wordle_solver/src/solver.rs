@@ -12,6 +12,8 @@ static OPENING_RESPONSE_CACHE: std::sync::OnceLock<Box<[usize; FEEDBACK_STATES]>
     std::sync::OnceLock::new();
 static THIRD_TURN_CACHE: std::sync::OnceLock<FxHashMap<StateKey, usize>> =
     std::sync::OnceLock::new();
+static FOURTH_TURN_CACHE: std::sync::OnceLock<FxHashMap<StateKey, usize>> =
+    std::sync::OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct SolveStep {
@@ -170,6 +172,15 @@ impl OfficialSolver {
                     state_hash: self.state_hash,
                 };
                 if let Some(&guess_index) = third_turn_cache(corpus).get(&cache_key) {
+                    return guess_index;
+                }
+            }
+            if self.turns_taken == 3 {
+                let cache_key = StateKey {
+                    remaining_count: self.remaining_count as u16,
+                    state_hash: self.state_hash,
+                };
+                if let Some(&guess_index) = fourth_turn_cache(corpus).get(&cache_key) {
                     return guess_index;
                 }
             }
@@ -404,6 +415,10 @@ fn third_turn_cache(corpus: &Corpus) -> &'static FxHashMap<StateKey, usize> {
     THIRD_TURN_CACHE.get_or_init(|| build_third_turn_cache(corpus))
 }
 
+fn fourth_turn_cache(corpus: &Corpus) -> &'static FxHashMap<StateKey, usize> {
+    FOURTH_TURN_CACHE.get_or_init(|| build_fourth_turn_cache(corpus))
+}
+
 fn build_opening_response_cache(corpus: &Corpus) -> Box<[usize; FEEDBACK_STATES]> {
     let mut table = [corpus.first_guess_index(); FEEDBACK_STATES];
     let opening_row = corpus.feedback_row(corpus.first_guess_index());
@@ -494,6 +509,106 @@ fn build_third_turn_cache(corpus: &Corpus) -> FxHashMap<StateKey, usize> {
                 },
                 solver.compute_best_guess(corpus),
             );
+        }
+    }
+
+    table
+}
+
+fn build_fourth_turn_cache(corpus: &Corpus) -> FxHashMap<StateKey, usize> {
+    let mut table = FxHashMap::default();
+    let opening_row = corpus.feedback_row(corpus.first_guess_index());
+
+    for feedback_code in 0..FEEDBACK_STATES {
+        let mut first_state_answers = Vec::new();
+
+        for (answer_index, &code) in opening_row.iter().enumerate() {
+            if code as usize == feedback_code {
+                first_state_answers.push(answer_index as u16);
+            }
+        }
+
+        if first_state_answers.is_empty() {
+            continue;
+        }
+
+        let second_guess = opening_response_guess(corpus, feedback_code as u8);
+        let second_row = corpus.feedback_row(second_guess);
+
+        for second_feedback in 0..FEEDBACK_STATES {
+            let mut second_state_answers = Vec::new();
+            let mut second_state_hash = 0_u64;
+
+            for &answer_index in &first_state_answers {
+                let answer_index = answer_index as usize;
+                if second_row[answer_index] as usize == second_feedback {
+                    second_state_answers.push(answer_index as u16);
+                    second_state_hash ^= corpus.answer_state_hash(answer_index);
+                }
+            }
+
+            if second_state_answers.is_empty() {
+                continue;
+            }
+
+            let second_state_key = StateKey {
+                remaining_count: second_state_answers.len() as u16,
+                state_hash: second_state_hash,
+            };
+            let third_guess =
+                if let Some(&guess_index) = third_turn_cache(corpus).get(&second_state_key) {
+                    guess_index
+                } else {
+                    let solver = OfficialSolver {
+                        remaining_count: second_state_answers.len(),
+                        remaining_answers: second_state_answers.clone(),
+                        scratch_answers: Vec::with_capacity(corpus.answer_count()),
+                        state_hash: second_state_hash,
+                        turns_taken: 2,
+                        opening_feedback: Some(feedback_code as u8),
+                        pending_guess: None,
+                        cached_guess: None,
+                        solved_word: None,
+                    };
+                    solver.compute_best_guess(corpus)
+                };
+            let third_row = corpus.feedback_row(third_guess);
+
+            for third_feedback in 0..FEEDBACK_STATES {
+                let mut remaining_answers = Vec::new();
+                let mut state_hash = 0_u64;
+
+                for &answer_index in &second_state_answers {
+                    let answer_index = answer_index as usize;
+                    if third_row[answer_index] as usize == third_feedback {
+                        remaining_answers.push(answer_index as u16);
+                        state_hash ^= corpus.answer_state_hash(answer_index);
+                    }
+                }
+
+                if remaining_answers.is_empty() {
+                    continue;
+                }
+
+                let solver = OfficialSolver {
+                    remaining_count: remaining_answers.len(),
+                    remaining_answers,
+                    scratch_answers: Vec::with_capacity(corpus.answer_count()),
+                    state_hash,
+                    turns_taken: 3,
+                    opening_feedback: Some(feedback_code as u8),
+                    pending_guess: None,
+                    cached_guess: None,
+                    solved_word: None,
+                };
+                table.insert(
+                    StateKey {
+                        remaining_count: solver.remaining_count as u16,
+                        state_hash: solver.state_hash,
+                    },
+                    solver.compute_best_guess(corpus),
+                );
+            }
         }
     }
 
