@@ -1,0 +1,11 @@
+[package]
+name = "benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wordle_solver = { path = "../../crates/wordle_solver" }
+
+[lints]
+workspace = true

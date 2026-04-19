@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/wordle_solver",
+    "tools/benchmarks",
+    "tools/opener_report",
+    "tools/wordle_cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.lints.clippy]
+checked_conversions = "deny"
+dbg_macro = "deny"
+explicit_into_iter_loop = "deny"
+explicit_iter_loop = "deny"
+filter_map_next = "deny"
+flat_map_option = "deny"
+let_unit_value = "deny"
+manual_assert = "deny"
+manual_ok_or = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unnecessary_wraps = "deny"
+unwrap_used = "deny"
+useless_transmute = "deny"
+used_underscore_binding = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

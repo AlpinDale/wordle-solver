@@ -1,0 +1,13 @@
+[package]
+name = "wordle_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm = "0.29"
+ratatui = "0.29"
+wordle_solver = { path = "../../crates/wordle_solver" }
+
+[lints]
+workspace = true

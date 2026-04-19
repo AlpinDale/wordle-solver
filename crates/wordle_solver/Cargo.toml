@@ -1,0 +1,12 @@
+[package]
+name = "wordle_solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wordle_solver"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
