@@ -30,4 +30,4 @@ useless_transmute = "deny"
 used_underscore_binding = "deny"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "allow"

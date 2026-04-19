@@ -1,11 +1,17 @@
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
 use crate::corpus::Corpus;
 use crate::{Feedback, SolverError, Word, FEEDBACK_STATES};
 
-static NEXT_GUESS_CACHE: OnceLock<Mutex<FxHashMap<Vec<u16>, usize>>> = OnceLock::new();
+thread_local! {
+    static NEXT_GUESS_CACHE: RefCell<FxHashMap<StateKey, Vec<CacheEntry>>> = RefCell::new(FxHashMap::default());
+}
+static OPENING_RESPONSE_CACHE: std::sync::OnceLock<Box<[usize; FEEDBACK_STATES]>> =
+    std::sync::OnceLock::new();
+static THIRD_TURN_CACHE: std::sync::OnceLock<FxHashMap<StateKey, usize>> =
+    std::sync::OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct SolveStep {
@@ -28,10 +34,12 @@ pub enum SolverStatus {
 
 #[derive(Debug)]
 pub struct OfficialSolver {
-    remaining: Box<[u64]>,
     remaining_answers: Vec<u16>,
-    remaining_answer_guess_flags: Box<[u8]>,
+    scratch_answers: Vec<u16>,
     remaining_count: usize,
+    state_hash: u64,
+    turns_taken: u8,
+    opening_feedback: Option<u8>,
     pending_guess: Option<usize>,
     cached_guess: Option<usize>,
     solved_word: Option<Word>,
@@ -48,6 +56,18 @@ struct GuessScore {
     worst_bucket: u16,
     expected_bucket_sum: u32,
     prefer_answer: bool,
+    guess_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct StateKey {
+    remaining_count: u16,
+    state_hash: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    answers: Box<[u16]>,
     guess_index: usize,
 }
 
@@ -86,25 +106,18 @@ impl GuessScore {
 impl OfficialSolver {
     pub fn try_new() -> Result<Self, SolverError> {
         let corpus = Corpus::load()?;
-        let mut remaining = vec![u64::MAX; corpus.answer_count().div_ceil(64)].into_boxed_slice();
-        let trailing = corpus.answer_count() % 64;
-        if trailing != 0 {
-            let last_index = remaining.len() - 1;
-            remaining[last_index] = (1_u64 << trailing) - 1;
-        }
         let remaining_answers = (0..corpus.answer_count())
             .map(|answer_index| answer_index as u16)
             .collect();
-        let mut remaining_answer_guess_flags = vec![0_u8; corpus.guess_count()].into_boxed_slice();
-        for answer_index in 0..corpus.answer_count() {
-            remaining_answer_guess_flags[corpus.answer_guess_index(answer_index)] = 1;
-        }
+        let scratch_answers = Vec::with_capacity(corpus.answer_count());
 
         Ok(Self {
-            remaining,
             remaining_answers,
-            remaining_answer_guess_flags,
+            scratch_answers,
             remaining_count: corpus.answer_count(),
+            state_hash: corpus.initial_state_hash(),
+            turns_taken: 0,
+            opening_feedback: None,
             pending_guess: None,
             cached_guess: Some(corpus.first_guess_index()),
             solved_word: None,
@@ -146,21 +159,44 @@ impl OfficialSolver {
             Err(error) => panic!("official bundle should be present: {error}"),
         };
         let guess_index = self.cached_guess.unwrap_or_else(|| {
-            let cache = NEXT_GUESS_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
-            if let Some(&guess_index) = cache
-                .lock()
-                .expect("next-guess cache lock should not be poisoned")
-                .get(self.remaining_answers.as_slice())
-            {
-                return guess_index;
+            if self.turns_taken == 1 {
+                if let Some(feedback_code) = self.opening_feedback {
+                    return opening_response_guess(corpus, feedback_code);
+                }
             }
+            if self.turns_taken == 2 {
+                let cache_key = StateKey {
+                    remaining_count: self.remaining_count as u16,
+                    state_hash: self.state_hash,
+                };
+                if let Some(&guess_index) = third_turn_cache(corpus).get(&cache_key) {
+                    return guess_index;
+                }
+            }
+            let cache_key = StateKey {
+                remaining_count: self.remaining_count as u16,
+                state_hash: self.state_hash,
+            };
+            NEXT_GUESS_CACHE.with(|cache| {
+                if let Some(entries) = cache.borrow().get(&cache_key) {
+                    for entry in entries {
+                        if entry.answers.as_ref() == self.remaining_answers.as_slice() {
+                            return entry.guess_index;
+                        }
+                    }
+                }
 
-            let guess_index = self.compute_best_guess(corpus);
-            cache
-                .lock()
-                .expect("next-guess cache lock should not be poisoned")
-                .insert(self.remaining_answers.clone(), guess_index);
-            guess_index
+                let guess_index = self.compute_best_guess(corpus);
+                cache
+                    .borrow_mut()
+                    .entry(cache_key)
+                    .or_default()
+                    .push(CacheEntry {
+                        answers: self.remaining_answers.clone().into_boxed_slice(),
+                        guess_index,
+                    });
+                guess_index
+            })
         });
         self.issue_guess_index(guess_index, corpus)
     }
@@ -189,32 +225,29 @@ impl OfficialSolver {
             .take()
             .ok_or(SolverError::GuessNotIssued)?;
 
-        let mut next_remaining = vec![0_u64; self.remaining.len()].into_boxed_slice();
-        let mut next_answers = Vec::with_capacity(self.remaining_answers.len());
+        self.scratch_answers.clear();
         let feedback_row = corpus.feedback_row(guess_index);
         let feedback_code = feedback.code();
+        let mut next_state_hash = 0_u64;
 
         for &answer_index in &self.remaining_answers {
             let answer_index = answer_index as usize;
             if feedback_row[answer_index] == feedback_code {
-                set_bit(&mut next_remaining, answer_index, true);
-                next_answers.push(answer_index as u16);
+                self.scratch_answers.push(answer_index as u16);
+                next_state_hash ^= corpus.answer_state_hash(answer_index);
             }
         }
 
-        if next_answers.is_empty() {
+        if self.scratch_answers.is_empty() {
             return Err(SolverError::Contradiction);
         }
-
-        let mut next_flags = vec![0_u8; corpus.guess_count()].into_boxed_slice();
-        for &answer_index in &next_answers {
-            next_flags[corpus.answer_guess_index(answer_index as usize)] = 1;
-        }
-
-        self.remaining = next_remaining;
-        self.remaining_count = next_answers.len();
-        self.remaining_answers = next_answers;
-        self.remaining_answer_guess_flags = next_flags;
+        self.remaining_count = self.scratch_answers.len();
+        self.state_hash = next_state_hash;
+        self.turns_taken = self.turns_taken.saturating_add(1);
+        self.opening_feedback = (self.turns_taken == 1
+            && guess_index == corpus.first_guess_index())
+        .then_some(feedback_code);
+        std::mem::swap(&mut self.remaining_answers, &mut self.scratch_answers);
         self.cached_guess = None;
 
         if feedback.is_solved() {
@@ -262,6 +295,11 @@ impl OfficialSolver {
             };
             return corpus.answer_guess_index(answer_index as usize);
         }
+        if self.remaining_count == 2 {
+            let first = corpus.answer_guess_index(self.remaining_answers[0] as usize);
+            let second = corpus.answer_guess_index(self.remaining_answers[1] as usize);
+            return first.min(second);
+        }
 
         let mut best = GuessScore {
             worst_bucket: u16::MAX,
@@ -269,6 +307,7 @@ impl OfficialSolver {
             prefer_answer: false,
             guess_index: usize::MAX,
         };
+        let perfect_expected_bucket_sum = self.remaining_count as u32;
 
         let mut scratch = GuessScoringScratch::new();
         for &answer_index in &self.remaining_answers {
@@ -278,21 +317,19 @@ impl OfficialSolver {
             {
                 if score.better_than(best) {
                     best = score;
+                    if best.worst_bucket == 1
+                        && best.expected_bucket_sum == perfect_expected_bucket_sum
+                    {
+                        return best.guess_index;
+                    }
                 }
             }
         }
 
-        for guess_index in 0..corpus.guess_count() {
-            if self.remaining_answer_guess_flags[guess_index] != 0 {
-                continue;
-            }
-            if let Some(score) = self.score_guess_index(
-                corpus,
-                guess_index,
-                false,
-                best,
-                &mut scratch,
-            ) {
+        for &guess_index in corpus.non_answer_guess_ids() {
+            if let Some(score) =
+                self.score_guess_index(corpus, guess_index as usize, false, best, &mut scratch)
+            {
                 if score.better_than(best) {
                     best = score;
                 }
@@ -358,12 +395,107 @@ impl OfficialSolver {
     }
 }
 
-fn set_bit(words: &mut [u64], index: usize, enabled: bool) {
-    let mask = 1_u64 << (index % 64);
-    let slot = &mut words[index / 64];
-    if enabled {
-        *slot |= mask;
-    } else {
-        *slot &= !mask;
+fn opening_response_guess(corpus: &Corpus, feedback_code: u8) -> usize {
+    OPENING_RESPONSE_CACHE.get_or_init(|| build_opening_response_cache(corpus))
+        [feedback_code as usize]
+}
+
+fn third_turn_cache(corpus: &Corpus) -> &'static FxHashMap<StateKey, usize> {
+    THIRD_TURN_CACHE.get_or_init(|| build_third_turn_cache(corpus))
+}
+
+fn build_opening_response_cache(corpus: &Corpus) -> Box<[usize; FEEDBACK_STATES]> {
+    let mut table = [corpus.first_guess_index(); FEEDBACK_STATES];
+    let opening_row = corpus.feedback_row(corpus.first_guess_index());
+
+    for (feedback_code, slot) in table.iter_mut().enumerate() {
+        let mut remaining_answers = Vec::new();
+        let mut state_hash = 0_u64;
+
+        for (answer_index, &code) in opening_row.iter().enumerate() {
+            if code as usize == feedback_code {
+                remaining_answers.push(answer_index as u16);
+                state_hash ^= corpus.answer_state_hash(answer_index);
+            }
+        }
+
+        if remaining_answers.is_empty() {
+            continue;
+        }
+
+        let solver = OfficialSolver {
+            remaining_count: remaining_answers.len(),
+            remaining_answers,
+            scratch_answers: Vec::with_capacity(corpus.answer_count()),
+            state_hash,
+            turns_taken: 1,
+            opening_feedback: Some(feedback_code as u8),
+            pending_guess: None,
+            cached_guess: None,
+            solved_word: None,
+        };
+        *slot = solver.compute_best_guess(corpus);
     }
+
+    Box::new(table)
+}
+
+fn build_third_turn_cache(corpus: &Corpus) -> FxHashMap<StateKey, usize> {
+    let mut table = FxHashMap::default();
+    let opening_row = corpus.feedback_row(corpus.first_guess_index());
+
+    for feedback_code in 0..FEEDBACK_STATES {
+        let mut first_state_answers = Vec::new();
+
+        for (answer_index, &code) in opening_row.iter().enumerate() {
+            if code as usize == feedback_code {
+                first_state_answers.push(answer_index as u16);
+            }
+        }
+
+        if first_state_answers.is_empty() {
+            continue;
+        }
+
+        let second_guess = opening_response_guess(corpus, feedback_code as u8);
+        let second_row = corpus.feedback_row(second_guess);
+
+        for second_feedback in 0..FEEDBACK_STATES {
+            let mut remaining_answers = Vec::new();
+            let mut state_hash = 0_u64;
+
+            for &answer_index in &first_state_answers {
+                let answer_index = answer_index as usize;
+                if second_row[answer_index] as usize == second_feedback {
+                    remaining_answers.push(answer_index as u16);
+                    state_hash ^= corpus.answer_state_hash(answer_index);
+                }
+            }
+
+            if remaining_answers.is_empty() {
+                continue;
+            }
+
+            let solver = OfficialSolver {
+                remaining_count: remaining_answers.len(),
+                remaining_answers,
+                scratch_answers: Vec::with_capacity(corpus.answer_count()),
+                state_hash,
+                turns_taken: 2,
+                opening_feedback: Some(feedback_code as u8),
+                pending_guess: None,
+                cached_guess: None,
+                solved_word: None,
+            };
+            table.insert(
+                StateKey {
+                    remaining_count: solver.remaining_count as u16,
+                    state_hash: solver.state_hash,
+                },
+                solver.compute_best_guess(corpus),
+            );
+        }
+    }
+
+    table
 }

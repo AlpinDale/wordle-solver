@@ -1,5 +1,6 @@
 mod asset;
 mod corpus;
+mod perf;
 mod solver;
 mod types;
 
@@ -7,6 +8,7 @@ use std::fmt;
 use std::io;
 
 pub use asset::{BundleData, LoadedBundle, BUNDLE_VERSION};
+pub use perf::{PerfClock, PerfMeasurement, PerfTimer};
 pub use solver::{OfficialSolver, SolveStep, SolveTrace, SolverStatus};
 pub use types::{score_guess, Feedback, Word, FEEDBACK_STATES, WORD_LEN};
 

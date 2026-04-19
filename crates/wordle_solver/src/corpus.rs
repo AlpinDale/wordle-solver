@@ -11,6 +11,9 @@ pub(crate) struct Corpus {
     corpus_hash: u64,
     guesses: Box<[Word]>,
     answer_ids: Box<[u16]>,
+    non_answer_ids: Box<[u16]>,
+    answer_state_hashes: Box<[u64]>,
+    initial_state_hash: u64,
     answer_positions: Box<[u16]>,
     feedback_matrix: Box<[u8]>,
     first_guess_index: usize,
@@ -30,10 +33,27 @@ impl Corpus {
             answer_positions[guess_index as usize] =
                 u16::try_from(answer_index).map_err(|_| SolverError::AssetCorrupt)?;
         }
+        let non_answer_ids = answer_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(guess_index, &answer_index)| {
+                (answer_index == u16::MAX).then_some(guess_index as u16)
+            })
+            .collect();
+        let answer_state_hashes = (0..bundle.answer_ids.len())
+            .map(|answer_index| splitmix64(answer_index as u64 + 1))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let initial_state_hash = answer_state_hashes
+            .iter()
+            .fold(0_u64, |acc, &hash| acc ^ hash);
         Ok(Self {
             corpus_hash: bundle.corpus_hash,
             guesses: bundle.guesses,
             answer_ids: bundle.answer_ids,
+            non_answer_ids,
+            answer_state_hashes,
+            initial_state_hash,
             answer_positions,
             feedback_matrix: bundle.feedback_matrix,
             first_guess_index: bundle.first_guess_index,
@@ -65,6 +85,11 @@ impl Corpus {
     }
 
     #[inline(always)]
+    pub fn non_answer_guess_ids(&self) -> &[u16] {
+        &self.non_answer_ids
+    }
+
+    #[inline(always)]
     pub fn answer_guess_index(&self, answer_index: usize) -> usize {
         self.answer_ids[answer_index] as usize
     }
@@ -73,6 +98,16 @@ impl Corpus {
     pub fn answer_index_for_guess(&self, guess_index: usize) -> Option<usize> {
         let answer_index = self.answer_positions[guess_index];
         (answer_index != u16::MAX).then_some(answer_index as usize)
+    }
+
+    #[inline(always)]
+    pub fn answer_state_hash(&self, answer_index: usize) -> u64 {
+        self.answer_state_hashes[answer_index]
+    }
+
+    #[inline(always)]
+    pub fn initial_state_hash(&self) -> u64 {
+        self.initial_state_hash
     }
 
     pub fn find_guess(&self, word: Word) -> Option<usize> {
@@ -95,5 +130,11 @@ impl Corpus {
     pub fn feedback(&self, guess_index: usize, answer_index: usize) -> Feedback {
         Feedback::from_code(self.feedback_row(guess_index)[answer_index])
     }
+}
 
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }

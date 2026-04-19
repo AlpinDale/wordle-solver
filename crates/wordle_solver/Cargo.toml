@@ -11,5 +11,8 @@ path = "src/lib.rs"
 [dependencies]
 rustc-hash = "2"
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+darwin-kperf-sys = "0.1.0"
+
 [lints]
 workspace = true
